@@ -1,4 +1,8 @@
 {-# LANGUAGE ApplicativeDo #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE StandaloneDeriving #-}
 
 module Main where
 
@@ -63,8 +67,10 @@ sep1 p s = (:) <$> p <*> star (parseString s *> p)
 
 ---------------------------------------
 
+
 type Name = String
 type TypeArg = String
+data Evaluation = Deferred | Forced deriving (Eq, Show)
 
 data Module = Module [DataDecl] [Definition] deriving Show
 
@@ -74,15 +80,17 @@ data Constructor = Constructor Name [Type] deriving Show
 
 data Type = Type Name | TypeApp Type Type deriving Show
 
-data Definition = Definition Name Expr deriving Show
+data Definition = Definition Name (Expr 'Deferred) deriving Show
 
-data Expr
-  = ERef Name
-  | EApp Expr Expr
-  | ELambda [Name] Expr
-  | ECase Expr [(Pattern, Expr)]
-  | EString String
-  deriving Show
+data Expr :: Evaluation -> * where
+  ERef :: Name -> Expr 'Deferred
+  EApp :: Expr 'Forced -> Expr 'Deferred -> Expr 'Forced
+  ELambda :: [Name] -> Expr 'Forced -> Expr 'Forced
+  ECase :: Expr 'Deferred -> [(Pattern, Expr 'Deferred)] -> Expr 'Deferred
+  EString :: String -> Expr 'Forced
+  EForce :: Expr 'Deferred -> Expr 'Forced
+  EDefer :: Expr 'Forced -> Expr 'Deferred
+deriving instance Show (Expr a)
 
 data Pattern = Pattern Name [Name] deriving Show
 
@@ -96,7 +104,7 @@ preProcess input = go input where
 
   dropComment []           = []
   dropComment ('-':'}':xs) = xs
-  dropComment (x:xs)       = dropComment xs
+  dropComment (_:xs)       = dropComment xs
 
 
 
@@ -144,13 +152,14 @@ parseDef = Definition
   <$> (spaced parseIdentifier <* spaced (parseString "="))
   <*> (spaced parseExpr <* parseSemi)
 
-parseNonAppExpr :: Parser Expr
+parseNonAppExpr :: Parser (Expr 'Deferred)
 parseNonAppExpr = parseAny [wrapped, estring, elambda, ecase, eref]  where
   eref = ERef <$> spaced parseIdentifier
 
   elambda = let lam = spaced (parseString "\\")
                 names = sep1 (spaced parseIdentifier) ""
-            in  ELambda <$> (lam *> names <* parseArrow) <*> parseExpr
+                f args body = EDefer (ELambda args (EForce body))
+            in  f <$> (lam *> names <* parseArrow) <*> parseExpr
 
   ecase =
     let case_ = spaced $ parseString "case"
@@ -165,12 +174,13 @@ parseNonAppExpr = parseAny [wrapped, estring, elambda, ecase, eref]  where
   -- TODO \"
   estring = let rest = Parser $ \s -> let v = takeWhile (/= '"') s
                                       in  [(v, drop (length v + 1) s)]
-            in  spaced $ EString <$> (parseString "\"" *> rest)
+            in  spaced $ EDefer . EString <$> (parseString "\"" *> rest)
 
   wrapped = spaced $ parened parseExpr
 
-parseExpr :: Parser Expr
-parseExpr = foldl1 EApp <$> sep1 (spaced parseNonAppExpr) ""
+parseExpr :: Parser (Expr 'Deferred)
+parseExpr = foldl1 f <$> sep1 (spaced parseNonAppExpr) "" where
+  f e1 e2  = EDefer $ EApp (EForce e1) e2
 
 
 parsePattern :: Parser Pattern
@@ -192,28 +202,34 @@ jsModule (Module decls defs) =
   unlines $ jsPrelude : map jsDecl decls ++ map jsDef defs ++ ["main();"]
 
 jsPrelude :: String
-jsPrelude = "const print = console.log"
+jsPrelude = unlines
+  [ "const __thunk=function(a){"
+  , "  var b,c;return b=!1,c=null,function(){return b||(c=a(),b=!0),c}"
+  , "};"
+  , "const print = __thunk(() => (x) => console.log(x()));"
+  , "const concat = __thunk(() => (a) => (b) => a() + b());"
+  ]
 
 jsDecl :: DataDecl -> String
-jsDecl (DataDecl name args constructors) =
+jsDecl (DataDecl _ _ constructors) =
   unlines $ map jsConstructor constructors
 
 jsConstructor :: Constructor -> String
 jsConstructor (Constructor name types) =
-  let args = map (\n -> "_" ++ show n) $ take (length types) [1..]
+  let args = map (\n -> "_" ++ show n) $ take (length types) [1 :: Int ..]
       curriedArgs = map (++ " =>") args
       lhs = if null curriedArgs then "" else unwords curriedArgs
       arr = "  const arr = [" ++ intercalate ", " args ++ "];"
       tag = "  arr.__constructor = " ++ show name ++ ";"
       ret = "  return arr;"
       rhs = unlines ["(function(){", arr, tag, ret, "}())"]
-  in  "const " ++ name ++ " = " ++ lhs ++ rhs
+  in  "const " ++ name ++ " = __thunk(() => " ++ lhs ++ rhs ++ ");"
 
 jsDef :: Definition -> String
 jsDef (Definition name expr) =
   "const " ++ name ++ " = " ++ jsExpr expr ++ ";"
 
-jsExpr :: Expr -> String
+jsExpr :: Expr a -> String
 jsExpr expr = case expr of
   ERef name ->
     name
@@ -227,8 +243,11 @@ jsExpr expr = case expr of
     in  jsArgs ++ " " ++ jsExpr body
 
   ECase scrutinee patterns ->
-    let value = "const __value = " ++ jsExpr scrutinee ++ ";"
-        cases = unlines $ map mkCase patterns ++ ["default: throw 'Missing pattern'"]
+    let value = "const __value = " ++ jsExpr (EForce scrutinee) ++ ";"
+        missing = [ "default: "
+                  , "throw 'Missing pattern: ' + __value.__constructor + ' for ' + __value"
+                  ]
+        cases = unlines $ map mkCase patterns ++ missing
         mkCase (Pattern cons args, rhs) =
           let assignments = "const [" ++ intercalate ", " args ++ "] = __value";
           in  "case " ++ show cons ++ ": \n" ++
@@ -239,8 +258,15 @@ jsExpr expr = case expr of
   EString s ->
     show s
 
+  EForce e ->
+    "(" ++ jsExpr e ++ ")()"
+
+  EDefer e ->
+    "__thunk(() => " ++ jsExpr e ++ ")"
+
 ---------------------------------------------------
 
+main :: IO ()
 main = do
   raw <- getContents
   let input = preProcess raw
