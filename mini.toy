@@ -1,0 +1,6 @@
+data Foo = Foo | Bar a b;
+msg = "hello";
+id = \x -> x;
+dollar = \f x -> f x;
+bla = \f -> case f of { Foo -> "foo"; Bar a b -> "bar"; };
+main = \go -> print (bla Foo);
