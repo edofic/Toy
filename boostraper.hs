@@ -112,13 +112,17 @@ parseIdentifier = Parser $ \s ->
 parseConstructor :: Parser Constructor
 parseConstructor =
   let name = spaced parseIdentifier
-      args = star parseType
+      args = star parseTypeNoApp
   in  Constructor <$> name <*> args
+
+parseTypeNoApp :: Parser Type
+parseTypeNoApp = parseSimple <|> parseParened where
+  parseSimple = spaced $ Type <$> parseIdentifier
+  parseParened = spaced $ parened $ parseType
 
 parseType :: Parser Type
 parseType = parseAll where
-  parseOne = spaced (Type <$> parseIdentifier <|> parened parseType)
-  parseMany = sep1 parseOne ""
+  parseMany = sep1 parseTypeNoApp ""
   parseAll = foldl1 TypeApp <$> parseMany
 
 parseDef :: Parser Definition
@@ -167,8 +171,64 @@ parseArrow = spaced (parseString "->") *> pure ()
 parseSemi :: Parser ()
 parseSemi = spaced (parseString ";") *> pure ()
 
+---------------------------------------------------
+
+jsModule :: Module -> String
+jsModule (Module decls defs) =
+  unlines $ jsPrelude : map jsDecl decls ++ map jsDef defs ++ ["main();"]
+
+jsPrelude :: String
+jsPrelude = "const print = console.log"
+
+jsDecl :: DataDecl -> String
+jsDecl (DataDecl name args constructors) =
+  unlines $ map jsConstructor constructors
+
+jsConstructor :: Constructor -> String
+jsConstructor (Constructor name types) =
+  let args = map (\n -> "_" ++ show n) $ take (length types) [1..]
+      curriedArgs = map (++ " =>") args
+      lhs = if null curriedArgs then "" else unwords curriedArgs
+      arr = "  const arr = [" ++ intercalate ", " args ++ "];"
+      tag = "  arr.__constructor = " ++ show name ++ ";"
+      ret = "  return arr;"
+      rhs = unlines ["(function(){", arr, tag, ret, "}())"]
+  in  "const " ++ name ++ " = " ++ lhs ++ rhs
+
+jsDef :: Definition -> String
+jsDef (Definition name expr) =
+  "const " ++ name ++ " = " ++ jsExpr expr ++ ";"
+
+jsExpr :: Expr -> String
+jsExpr expr = case expr of
+  ERef name ->
+    name
+
+  EApp e1 e2 ->
+    "(" ++ jsExpr e1 ++ ")(" ++ jsExpr e2 ++ ")"
+
+  ELambda args body ->
+    let curriedArgs = map (++ " =>") args
+        jsArgs = if null curriedArgs then "" else unwords curriedArgs
+    in  jsArgs ++ " " ++ jsExpr body
+
+  ECase scrutinee patterns ->
+    let value = "const __value = " ++ jsExpr scrutinee ++ ";"
+        cases = unlines $ map mkCase patterns ++ ["default: throw 'Missing pattern'"]
+        mkCase (Pattern cons args, rhs) =
+          let assignments = "const [" ++ intercalate ", " args ++ "] = __value";
+          in  "case " ++ show cons ++ ": \n" ++
+                assignments ++ "\nreturn " ++ jsExpr rhs
+
+    in  "(function(){\n" ++ value ++ "\nswitch (__value.__constructor) {\n" ++ cases ++ "}}())"
+
+  EString s ->
+    show s
+
+---------------------------------------------------
 
 main = do
   input <- getContents
   let ast = runParserSimple parseModule input
-  print ast
+      js  = jsModule <$> ast
+  maybe (return ()) putStrLn js
