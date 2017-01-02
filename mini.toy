@@ -1,6 +1,7 @@
 data Foo = Foo | Bar a b;
 msg = "hello";
 id = \x -> x;
+{- top level comment -}
 dollar = \f x -> f x;
-bla = \f -> case f of { Foo -> "foo"; Bar a b -> "bar"; };
+bla = \f -> case f of { Foo -> "foo"; Bar a {- inline comment -} b -> "bar"; };
 main = \go -> print (bla Foo);

@@ -88,6 +88,20 @@ data Pattern = Pattern Name [Name] deriving Show
 
 ---------------------------------------
 
+preProcess :: String -> String
+preProcess input = go input where
+  go []           = []
+  go ('{':'-':xs) = preProcess $ dropComment xs
+  go (x:xs)       = x : preProcess xs
+
+  dropComment []           = []
+  dropComment ('-':'}':xs) = xs
+  dropComment (x:xs)       = dropComment xs
+
+
+
+----------------------------------------
+
 parseModule :: Parser Module
 parseModule =
   fmap toModule $ star $ parseAny [Left <$> parseDecl, Right <$> parseDef]
@@ -228,7 +242,10 @@ jsExpr expr = case expr of
 ---------------------------------------------------
 
 main = do
-  input <- getContents
-  let ast = runParserSimple parseModule input
+  raw <- getContents
+  let input = preProcess raw
+      ast = runParserSimple parseModule input
+      debugParser = unlines $ map show $ runParser parseModule input
       js  = jsModule <$> ast
-  maybe (return ()) putStrLn js
+  maybe (putStrLn $ "failed to parse: " ++ debugParser)
+         putStrLn js
